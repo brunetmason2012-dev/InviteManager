@@ -1,12 +1,11 @@
 const {
   Client,
   GatewayIntentBits,
-  Partials,
   PermissionsBitField,
+  EmbedBuilder,
   SlashCommandBuilder,
   REST,
-  Routes,
-  EmbedBuilder
+  Routes
 } = require("discord.js");
 
 const fs = require("fs");
@@ -21,18 +20,32 @@ if (!TOKEN || !CLIENT_ID) {
 
 const DATA_FILE = "./data.json";
 
-let data = {};
+let db = {};
 
 if (fs.existsSync(DATA_FILE)) {
   try {
-    data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    db = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
   } catch {
-    data = {};
+    db = {};
   }
 }
 
-function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+function save() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+}
+
+function getGuild(guildId) {
+  if (!db[guildId]) {
+    db[guildId] = {
+      invites: {},
+      inviteCache: {},
+      logChannel: null,
+      roles: []
+    };
+    save();
+  }
+
+  return db[guildId];
 }
 
 const client = new Client({
@@ -40,45 +53,48 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildInvites
-  ],
-  partials: [Partials.GuildMember]
+  ]
 });
+
+// ==========================
+// SLASH COMMANDS
+// ==========================
 
 const commands = [
   new SlashCommandBuilder()
     .setName("setup")
-    .setDescription("Set up the invite system.")
+    .setDescription("Set up the invite log channel.")
     .addChannelOption(option =>
       option
-        .setName("logchannel")
-        .setDescription("Channel for invite logs.")
+        .setName("channel")
+        .setDescription("Invite log channel")
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("setrole")
-    .setDescription("Give a role automatically at a certain invite amount.")
+    .setDescription("Set an automatic invite role.")
     .addIntegerOption(option =>
       option
         .setName("invites")
-        .setDescription("Number of invites required.")
-        .setMinValue(1)
+        .setDescription("Number of invites required")
         .setRequired(true)
+        .setMinValue(1)
     )
     .addRoleOption(option =>
       option
         .setName("role")
-        .setDescription("Role to give.")
+        .setDescription("Role to automatically give")
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName("invites")
-    .setDescription("Check someone's invites.")
+    .setDescription("Check invite statistics.")
     .addUserOption(option =>
       option
         .setName("user")
-        .setDescription("User to check.")
+        .setDescription("User to check")
         .setRequired(false)
     ),
 
@@ -88,7 +104,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("config")
-    .setDescription("Show the current invite configuration."),
+    .setDescription("Show the invite configuration."),
 
   new SlashCommandBuilder()
     .setName("resetinvites")
@@ -96,10 +112,14 @@ const commands = [
     .addUserOption(option =>
       option
         .setName("user")
-        .setDescription("User to reset.")
+        .setDescription("User to reset")
         .setRequired(true)
     )
 ].map(command => command.toJSON());
+
+// ==========================
+// READY
+// ==========================
 
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -114,149 +134,145 @@ client.once("ready", async () => {
 
     console.log("✅ Slash commands registered.");
   } catch (error) {
-    console.error("❌ Command registration error:", error);
+    console.error("❌ Failed to register commands:", error);
   }
 
-  // Save the current invite cache.
+  // Cache existing invites
   for (const guild of client.guilds.cache.values()) {
+    const guildData = getGuild(guild.id);
+
     try {
       const invites = await guild.invites.fetch();
 
-      if (!data[guild.id]) {
-        data[guild.id] = {
-          invites: {},
-          settings: {
-            logChannel: null,
-            roles: []
-          }
-        };
+      guildData.inviteCache = {};
+
+      for (const invite of invites.values()) {
+        guildData.inviteCache[invite.code] = invite.uses || 0;
       }
-
-      data[guild.id].inviteCache = {};
-
-      invites.forEach(invite => {
-        data[guild.id].inviteCache[invite.code] = invite.uses || 0;
-      });
-    } catch (error) {
-      console.log(`Could not fetch invites for ${guild.name}`);
+    } catch {
+      console.log(`⚠️ Could not fetch invites for ${guild.name}`);
     }
   }
 
-  saveData();
+  save();
 });
 
+// ==========================
+// NEW SERVER
+// ==========================
+
 client.on("guildCreate", async guild => {
-  data[guild.id] = {
-    invites: {},
-    settings: {
-      logChannel: null,
-      roles: []
-    },
-    inviteCache: {}
-  };
+  const guildData = getGuild(guild.id);
 
   try {
     const invites = await guild.invites.fetch();
 
-    invites.forEach(invite => {
-      data[guild.id].inviteCache[invite.code] = invite.uses || 0;
-    });
-  } catch {}
+    guildData.inviteCache = {};
 
-  saveData();
+    for (const invite of invites.values()) {
+      guildData.inviteCache[invite.code] = invite.uses || 0;
+    }
+
+    save();
+  } catch {}
 });
+
+// ==========================
+// MEMBER JOIN
+// ==========================
 
 client.on("guildMemberAdd", async member => {
   const guild = member.guild;
-
-  if (!data[guild.id]) {
-    data[guild.id] = {
-      invites: {},
-      settings: {
-        logChannel: null,
-        roles: []
-      },
-      inviteCache: {}
-    };
-  }
+  const guildData = getGuild(guild.id);
 
   let usedInvite = null;
 
   try {
-    const oldCache = data[guild.id].inviteCache || {};
+    const oldCache = guildData.inviteCache || {};
     const newInvites = await guild.invites.fetch();
 
-    newInvites.forEach(invite => {
+    for (const invite of newInvites.values()) {
       const oldUses = oldCache[invite.code] || 0;
       const newUses = invite.uses || 0;
 
       if (newUses > oldUses) {
         usedInvite = invite;
+        break;
       }
-    });
+    }
 
-    data[guild.id].inviteCache = {};
+    guildData.inviteCache = {};
 
-    newInvites.forEach(invite => {
-      data[guild.id].inviteCache[invite.code] = invite.uses || 0;
-    });
+    for (const invite of newInvites.values()) {
+      guildData.inviteCache[invite.code] = invite.uses || 0;
+    }
   } catch (error) {
-    console.log("Could not determine used invite.");
+    console.log("⚠️ Could not determine used invite.");
   }
 
   if (!usedInvite || !usedInvite.inviter) {
-    saveData();
+    save();
     return;
   }
 
   const inviterId = usedInvite.inviter.id;
 
-  if (!data[guild.id].invites[inviterId]) {
-    data[guild.id].invites[inviterId] = 0;
+  if (!guildData.invites[inviterId]) {
+    guildData.invites[inviterId] = 0;
   }
 
-  data[guild.id].invites[inviterId]++;
+  guildData.invites[inviterId]++;
 
-  const inviteCount = data[guild.id].invites[inviterId];
+  const totalInvites = guildData.invites[inviterId];
 
-  // Automatic roles
-  const roles = data[guild.id].settings.roles || [];
+  console.log(
+    `📨 ${member.user.tag} joined through ${usedInvite.inviter.tag} (${totalInvites} invites)`
+  );
 
-  for (const roleConfig of roles) {
-    if (inviteCount >= roleConfig.invites) {
-      const role = guild.roles.cache.get(roleConfig.roleId);
+  // ==========================
+  // AUTOMATIC ROLES
+  // ==========================
+
+  for (const roleData of guildData.roles) {
+    if (totalInvites < roleData.invites) continue;
+
+    const role = guild.roles.cache.get(roleData.roleId);
+
+    if (!role) continue;
+
+    try {
+      const inviterMember = await guild.members.fetch(inviterId);
 
       if (
-        role &&
         guild.members.me &&
-        role.position < guild.members.me.roles.highest.position
+        role.position < guild.members.me.roles.highest.position &&
+        !inviterMember.roles.cache.has(role.id)
       ) {
-        try {
-          if (!member.roles.cache.has(role.id)) {
-            // Role goes to the inviter, not the new member.
-            const inviterMember = await guild.members.fetch(inviterId);
+        await inviterMember.roles.add(role);
 
-            if (!inviterMember.roles.cache.has(role.id)) {
-              await inviterMember.roles.add(role);
-            }
-          }
-        } catch (error) {
-          console.log("Could not give automatic role.");
-        }
+        console.log(
+          `🎉 ${inviterMember.user.tag} received ${role.name}`
+        );
       }
+    } catch (error) {
+      console.log("⚠️ Could not give automatic role.");
     }
   }
 
-  const logChannelId = data[guild.id].settings.logChannel;
+  // ==========================
+  // INVITE LOG
+  // ==========================
 
-  if (logChannelId) {
-    const channel = guild.channels.cache.get(logChannelId);
+  if (guildData.logChannel) {
+    const channel = guild.channels.cache.get(
+      guildData.logChannel
+    );
 
     if (channel) {
       const embed = new EmbedBuilder()
         .setTitle("📨 New Invite")
         .setDescription(
-          `${member} joined using an invite from <@${inviterId}>.`
+          `${member} joined the server.`
         )
         .addFields(
           {
@@ -266,7 +282,7 @@ client.on("guildMemberAdd", async member => {
           },
           {
             name: "📊 Total Invites",
-            value: `${inviteCount}`,
+            value: `${totalInvites}`,
             inline: true
           }
         )
@@ -276,35 +292,30 @@ client.on("guildMemberAdd", async member => {
     }
   }
 
-  saveData();
+  save();
 });
+
+// ==========================
+// COMMANDS
+// ==========================
 
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
-  const guild = interaction.guild;
-
-  if (!guild) {
+  if (!interaction.guild) {
     return interaction.reply({
       content: "❌ This command can only be used inside a server.",
       ephemeral: true
     });
   }
 
-  if (!data[guild.id]) {
-    data[guild.id] = {
-      invites: {},
-      settings: {
-        logChannel: null,
-        roles: []
-      },
-      inviteCache: {}
-    };
-  }
+  const guild = interaction.guild;
+  const guildData = getGuild(guild.id);
 
-  const serverData = data[guild.id];
-
+  // ==========================
   // /setup
+  // ==========================
+
   if (interaction.commandName === "setup") {
     if (
       !interaction.member.permissions.has(
@@ -312,23 +323,26 @@ client.on("interactionCreate", async interaction => {
       )
     ) {
       return interaction.reply({
-        content: "❌ You need **Manage Server** to use this.",
+        content: "❌ You need **Manage Server**.",
         ephemeral: true
       });
     }
 
-    const channel = interaction.options.getChannel("logchannel");
+    const channel = interaction.options.getChannel("channel");
 
-    serverData.settings.logChannel = channel.id;
+    guildData.logChannel = channel.id;
 
-    saveData();
+    save();
 
-    return interaction.reply({
-      content: `✅ Invite logs are now sent to ${channel}.`
-    });
+    return interaction.reply(
+      `✅ Invite logs are now sent to ${channel}.`
+    );
   }
 
+  // ==========================
   // /setrole
+  // ==========================
+
   if (interaction.commandName === "setrole") {
     if (
       !interaction.member.permissions.has(
@@ -336,7 +350,7 @@ client.on("interactionCreate", async interaction => {
       )
     ) {
       return interaction.reply({
-        content: "❌ You need **Manage Server** to use this.",
+        content: "❌ You need **Manage Server**.",
         ephemeral: true
       });
     }
@@ -346,7 +360,7 @@ client.on("interactionCreate", async interaction => {
 
     if (role.managed) {
       return interaction.reply({
-        content: "❌ You cannot use a managed/integration role.",
+        content: "❌ You cannot use a managed role.",
         ephemeral: true
       });
     }
@@ -357,105 +371,131 @@ client.on("interactionCreate", async interaction => {
     ) {
       return interaction.reply({
         content:
-          "❌ I cannot give this role. Move my bot role above that role.",
+          "❌ Move my bot's role above the role you want it to give.",
         ephemeral: true
       });
     }
 
-    serverData.settings.roles =
-      serverData.settings.roles.filter(r => r.invites !== invites);
+    guildData.roles = guildData.roles.filter(
+      r => r.invites !== invites
+    );
 
-    serverData.settings.roles.push({
+    guildData.roles.push({
       invites,
       roleId: role.id
     });
 
-    serverData.settings.roles.sort((a, b) => a.invites - b.invites);
+    guildData.roles.sort(
+      (a, b) => a.invites - b.invites
+    );
 
-    saveData();
+    save();
 
-    return interaction.reply({
-      content: `✅ Users will now receive ${role} at **${invites} invites**.`
-    });
+    return interaction.reply(
+      `✅ ${role} will automatically be given at **${invites} invites**.`
+    );
   }
 
+  // ==========================
   // /invites
+  // ==========================
+
   if (interaction.commandName === "invites") {
     const user =
-      interaction.options.getUser("user") || interaction.user;
+      interaction.options.getUser("user") ||
+      interaction.user;
 
-    const count = serverData.invites[user.id] || 0;
+    const count =
+      guildData.invites[user.id] || 0;
+
+    const embed = new EmbedBuilder()
+      .setTitle("📨 Invite Stats")
+      .setDescription(
+        `${user} has **${count} invites**.`
+      )
+      .setTimestamp();
 
     return interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("📨 Invite Stats")
-          .setDescription(`${user} has **${count} invites**.`)
-          .setTimestamp()
-      ]
+      embeds: [embed]
     });
   }
 
+  // ==========================
   // /leaderboard
+  // ==========================
+
   if (interaction.commandName === "leaderboard") {
-    const sorted = Object.entries(serverData.invites)
+    const leaderboard = Object.entries(
+      guildData.invites
+    )
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10);
 
-    if (sorted.length === 0) {
-      return interaction.reply("📊 No invites have been tracked yet.");
+    if (!leaderboard.length) {
+      return interaction.reply(
+        "📊 No invites have been tracked yet."
+      );
     }
 
-    let description = "";
+    let text = "";
 
-    for (let i = 0; i < sorted.length; i++) {
-      const [userId, count] = sorted[i];
+    leaderboard.forEach(
+      ([userId, count], index) => {
+        text +=
+          `**${index + 1}.** <@${userId}> — **${count} invites**\n`;
+      }
+    );
 
-      description += `**${i + 1}.** <@${userId}> — **${count} invites**\n`;
-    }
+    const embed = new EmbedBuilder()
+      .setTitle("🏆 Invite Leaderboard")
+      .setDescription(text)
+      .setTimestamp();
 
     return interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("🏆 Invite Leaderboard")
-          .setDescription(description)
-          .setTimestamp()
-      ]
+      embeds: [embed]
     });
   }
 
+  // ==========================
   // /config
+  // ==========================
+
   if (interaction.commandName === "config") {
-    const logChannel = serverData.settings.logChannel
-      ? `<#${serverData.settings.logChannel}>`
+    const logChannel = guildData.logChannel
+      ? `<#${guildData.logChannel}>`
       : "Not configured";
 
-    const roles =
-      serverData.settings.roles.length > 0
-        ? serverData.settings.roles
-            .map(r => `${r.invites} invites → <@&${r.roleId}>`)
-            .join("\n")
-        : "No automatic roles";
+    const roles = guildData.roles.length
+      ? guildData.roles
+          .map(
+            r =>
+              `**${r.invites} invites** → <@&${r.roleId}>`
+          )
+          .join("\n")
+      : "No automatic roles configured.";
+
+    const embed = new EmbedBuilder()
+      .setTitle("⚙️ Invite Configuration")
+      .addFields(
+        {
+          name: "📢 Log Channel",
+          value: logChannel
+        },
+        {
+          name: "🎖️ Automatic Roles",
+          value: roles
+        }
+      );
 
     return interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("⚙️ Invite Configuration")
-          .addFields(
-            {
-              name: "📢 Log Channel",
-              value: logChannel
-            },
-            {
-              name: "🎖️ Automatic Roles",
-              value: roles
-            }
-          )
-      ]
+      embeds: [embed]
     });
   }
 
+  // ==========================
   // /resetinvites
+  // ==========================
+
   if (interaction.commandName === "resetinvites") {
     if (
       !interaction.member.permissions.has(
@@ -463,21 +503,38 @@ client.on("interactionCreate", async interaction => {
       )
     ) {
       return interaction.reply({
-        content: "❌ You need **Manage Server** to use this.",
+        content: "❌ You need **Manage Server**.",
         ephemeral: true
       });
     }
 
-    const user = interaction.options.getUser("user");
+    const user =
+      interaction.options.getUser("user");
 
-    serverData.invites[user.id] = 0;
+    guildData.invites[user.id] = 0;
 
-    saveData();
+    save();
 
-    return interaction.reply({
-      content: `✅ Invite count for ${user} has been reset.`
-    });
+    return interaction.reply(
+      `✅ ${user}'s invites have been reset to **0**.`
+    );
   }
 });
+
+// ==========================
+// ERRORS
+// ==========================
+
+client.on("error", error => {
+  console.error("Discord error:", error);
+});
+
+process.on("unhandledRejection", error => {
+  console.error("Unhandled rejection:", error);
+});
+
+// ==========================
+// LOGIN
+// ==========================
 
 client.login(TOKEN);
